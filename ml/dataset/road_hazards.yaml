@@ -1,0 +1,36 @@
+# RoadGuard Atlas — canonical YOLO detection dataset schema.
+#
+# 7 classes, in EXACTLY the order of src/lib/rg/constants.ts -> HAZARD_CLASSES
+# (mirrored in ml/hazard_domain.py). Class ids in label files must match:
+#   0 pothole | 1 crack | 2 erosion | 3 waterlogging | 4 marking
+#   5 debris  | 6 edge_damage
+#
+# Path resolution (handled by ml/train.py / ml/evaluate.py, not raw Ultralytics):
+#   1. If ROADGUARD_DATA_ROOT (env) is set, `path` is joined onto it.
+#   2. Otherwise relative `path` is resolved against THIS file's directory.
+# A resolved copy with absolute paths is generated automatically before training
+# so raw Ultralytics never mis-resolves relative to its own datasets_dir.
+#
+# Expected layout (produced by scripts/split_dataset.py):
+#   <path>/images/{train,val,test}/*.jpg
+#   <path>/labels/{train,val,test}/*.txt   (one .txt per image, YOLO format:
+#                                           class_id cx cy w h, all normalized)
+
+path: ../datasets/road_hazards   # override with ROADGUARD_DATA_ROOT
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: pothole
+  1: crack
+  2: erosion
+  3: waterlogging
+  4: marking
+  5: debris
+  6: edge_damage
+
+# Optional metadata (ignored by Ultralytics, used by our tooling)
+rg_meta:
+  version: 1
+  license: mixed   # see README "Dataset licensing" — depends on sources merged in
+  city_context: Bengaluru, India

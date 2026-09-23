@@ -1,0 +1,129 @@
+name: Deploy
+
+# RoadGuard Atlas — image publishing + deploy hook (tag-driven releases)
+#
+# Trigger: push a tag `v*` (e.g. v1.0.0) → builds & pushes versioned images
+# to GHCR, then calls the DEPLOY_HOOK_URL secret (Render/Vercel/webhook or an
+# SSH-based runner) to roll out.
+#
+# Image naming (versioned + latest):
+#   ghcr.io/<owner>/<repo>/frontend:v1.0.0   (infrastructure/docker/frontend.Dockerfile)
+#   ghcr.io/<owner>/<repo>/backend :v1.0.0   (backend/Dockerfile — owned by backend agent)
+#   ghcr.io/<owner>/<repo>/worker  :v1.0.0   (infrastructure/docker/worker.Dockerfile)
+#   ghcr.io/<owner>/<repo>/ml      :v1.0.0   (ml/Dockerfile — owned by ml agent)
+#
+# ROLLBACK RUNBOOK (keep in sync with infrastructure/README.md):
+#   1. App tier — re-deploy the previous tag:
+#        docker compose pull && docker tag ghcr.io/<repo>/api:vX.Y.Z ... && \
+#        docker compose up -d
+#      (blue/green: keep the previous compose project running on :8001,
+#       flip the reverse proxy, then stop blue — see infrastructure/README.md)
+#   2. Database — only if a migration must be reverted:
+#        alembic downgrade -1            # in backend/, against DATABASE_URL
+#      Precondition: restore-ready backup taken before upgrade:
+#        pg_dump -Fc "$DATABASE_URL" > backups/pre-upgrade-<tag>.dump
+#        # restore: pg_restore -d "$DATABASE_URL" --clean --if-exists <file>
+#   3. Frontend — Vercel: `vercel rollback <deployment-url>`; Netlify: deploys
+#      → publish previous build.
+#   4. Verify: GET /health (api), GET / (frontend), /metrics scrape, then
+#      watch SENTRY_DSN error rates for 30 minutes before closing the incident.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build & push ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Frontend builds from the repo root (Next.js app lives at root)
+          - name: frontend
+            context: .
+            dockerfile: infrastructure/docker/frontend.Dockerfile
+            guard: package.json
+          # backend & ml own their Dockerfiles (other agents) — build in place
+          - name: backend
+            context: ./backend
+            dockerfile: backend/Dockerfile
+            guard: backend/Dockerfile
+          # Worker = dedicated celery image (packages backend/requirements.txt)
+          - name: worker
+            context: .
+            dockerfile: infrastructure/docker/worker.Dockerfile
+            guard: backend/requirements.txt
+          - name: ml
+            context: ./ml
+            dockerfile: ml/Dockerfile
+            guard: ml/Dockerfile
+    # Skip gracefully if a component's Dockerfile does not exist yet
+    if: ${{ hashFiles(matrix.guard) != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Trigger deploy (placeholder hook)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Trigger DEPLOY_HOOK_URL (set as a repo secret)
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.DEPLOY_HOOK_URL }}
+        if: ${{ env.DEPLOY_HOOK_URL != '' }}
+        run: |
+          echo "Triggering deploy hook for ${GITHUB_REF_NAME}…"
+          curl -fsS -X POST "$DEPLOY_HOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag\": \"${GITHUB_REF_NAME}\"}"
+
+      - name: No hook configured (informational)
+        if: ${{ env.DEPLOY_HOOK_URL == '' }}
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.DEPLOY_HOOK_URL }}
+        run: |
+          echo "DEPLOY_HOOK_URL secret not set — images for ${GITHUB_REF_NAME} are published to GHCR."
+          echo "Deploy manually (docker compose pull && docker compose up -d) or configure the hook."
+          echo "Rollback: see the runbook in the workflow header and infrastructure/README.md."

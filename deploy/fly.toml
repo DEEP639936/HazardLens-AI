@@ -1,0 +1,91 @@
+# =============================================================================
+# HazardLensAI — Fly.io configuration (FastAPI backend example)
+#
+# One fly.toml configures ONE app. This file configures the API app; the ML
+# inference service is a near-identical copy (see commented block at the end).
+#
+# First-time setup (from the repo root):
+#   fly auth login
+#   fly launch --no-deploy --dockerfile backend/Dockerfile --copy-config \
+#       --name roadguard-api --region bom
+#   # managed Postgres (Fly Postgres Flex) — PostGIS supported:
+#   fly postgres create --name roadguard-db --region bom
+#   fly postgres attach roadguard-db --app roadguard-api   # sets DATABASE_URL
+#   fly postgres connect roadguard-db  →  CREATE EXTENSION IF NOT EXISTS postgis;
+#   fly secrets set JWT_SECRET="$(openssl rand -hex 32)"
+#   fly deploy
+#
+# Health checks hit /health (see AGENT_BRIEF API surface).
+# =============================================================================
+
+# app name is written by `fly launch`; override or keep as-is
+app = "roadguard-api"
+primary_region = "bom"           # Mumbai — closest to the Bengaluru demo city
+
+[build]
+  # backend/ owns its Dockerfile; path is relative to this fly.toml.
+  # Alternative: keep fly.toml at the repo root and set dockerfile = "backend/Dockerfile"
+  dockerfile = "../backend/Dockerfile"
+
+[env]
+  PORT = "8000"
+  APP_ENV = "production"
+  # DATABASE_URL is injected by `fly postgres attach` — do NOT commit it here.
+  # Engine normalization: postgresql:// → postgresql+psycopg:// is done in code.
+  CORS_ORIGINS = "https://roadguard-atlas.vercel.app"
+  INFERENCE_SERVICE_URL = "https://roadguard-ml-inference.fly.dev"
+  MLFLOW_TRACKING_URI = "http://roadguard-mlflow.fly.dev:5000"
+  STORAGE_BACKEND = "s3"
+  S3_FORCE_PATH_STYLE = "false"
+  # Secrets (set via `fly secrets`, never in this file):
+  #   JWT_SECRET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_ENDPOINT,
+  #   S3_BUCKET, SENTRY_DSN, MLFLOW_TRACKING_TOKEN
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 1       # keep one warm machine (cold starts hurt UX)
+
+  [http_service.checks]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+
+# =============================================================================
+# Companion app example — ML inference service (copy to ml/fly.toml)
+# =============================================================================
+# app = "roadguard-ml-inference"
+# primary_region = "bom"
+#
+# [build]
+#   dockerfile = "../ml/Dockerfile"
+#
+# [env]
+#   PORT = "8100"
+#   MODEL_PATH = "/models/best.onnx"
+#   INFERENCE_DEVICE = "cpu"
+#
+# [http_service]
+#   internal_port = 8100
+#   force_https = true
+#   auto_stop_machines = "suspend"
+#   auto_start_machines = true
+#   min_machines_running = 0            # scale-to-zero OK for inference
+#
+#   [http_service.checks]
+#     interval = "15s"
+#     timeout = "5s"
+#     path = "/health"
+#
+# [[vm]]
+#   size = "shared-cpu-1x"
+#   memory = "2gb"                      # model weights + runtime overhead
+# =============================================================================

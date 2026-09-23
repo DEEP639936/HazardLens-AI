@@ -1,0 +1,317 @@
+// RoadGuard Atlas — operational schema (live demo mode, SQLite).
+// Production mode uses PostgreSQL + PostGIS: see backend/app/models.py (geography(Point,4326), GiST indexes)
+// and backend/alembic migrations. Spatial predicates (radius, nearest, bbox) are implemented in the
+// app layer here via Haversine (src/lib/rg/geo.ts) and by PostGIS ST_DWithin in production.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  passwordHash  String
+  name          String
+  role          String   @default("CITIZEN") // CITIZEN | FIELD_WORKER | AUTHORITY | ADMIN
+  phone         String?
+  ward          String?
+  notifyInApp   Boolean  @default(true)
+  geoConsent    Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  refreshTokens     RefreshToken[]
+  reports           HazardReport[]
+  notifications     Notification[]
+  workOrderUpdates  WorkOrderUpdate[]
+  assignedWorkOrders WorkOrder[]      @relation("AssignedFieldWorker")
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model MediaAsset {
+  id          String   @id @default(cuid())
+  kind        String   @default("ORIGINAL") // ORIGINAL | ANNOTATED | FRAME | THUMBNAIL
+  storagePath String
+  mimeType    String
+  sizeBytes   Int
+  width       Int?
+  height      Int?
+  durationSec Float?
+  checksum    String?
+  perceptualHash String? // 8x8 average-hash hex (duplicate image similarity)
+  reportId    String?
+  report      HazardReport? @relation(fields: [reportId], references: [id])
+  inferenceJobs InferenceJob[]
+  createdAt   DateTime @default(now())
+
+  @@index([reportId])
+}
+
+model HazardReport {
+  id              String    @id @default(cuid())
+  referenceCode   String    @unique
+  userId          String?
+  user            User?     @relation(fields: [userId], references: [id])
+  submitterName   String?
+  submitterEmail  String?
+  hazardClass     String // pothole | crack | erosion | waterlogging | marking | debris | edge_damage
+  hazardClassAi   String?
+  severity        Int       @default(3) // 1..5 operational heuristic, admin-overridable
+  severityAi      Int?
+  notes           String?
+  status          String    @default("REPORTED")
+  // Centralized hazard lifecycle: REPORTED → AI_VERIFIED → PENDING_REVIEW → VERIFIED
+  //   → ASSIGNED → IN_PROGRESS → RESOLVED → CLOSED  (+ terminal REJECTED | MERGED | FLAGGED)
+  lat             Float
+  lng             Float
+  address         String?
+  ward            String?
+  roadName        String?
+  roadClass       String? // highway | arterial | collector | residential
+  roadCriticality Float? // 0..1 explicit override
+  duplicateOfId   String?
+  reportCount     Int       @default(1) // canonical hazard: 1 + merged duplicate reports
+  uniqueReporters Int       @default(1) // distinct submitters across the merge group
+  lastReportedAt  DateTime? @default(now())
+  geoConsent      Boolean   @default(false)
+  blurRequested   Boolean   @default(false)
+  source          String    @default("WEB_UPLOAD") // WEB_UPLOAD | DEMO_SEED | IMPORT
+  reviewedAt      DateTime?
+  reviewedBy      String?
+  reviewNote      String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  media             MediaAsset[]
+  detections        Detection[]
+  clusterId         String?
+  cluster           HazardCluster?  @relation(fields: [clusterId], references: [id])
+  clusterMemberships ClusterMembership[]
+  priorityScores    PriorityScore[]
+  workOrder         WorkOrder?
+  mergedInto        HazardReport?   @relation("Merges", fields: [duplicateOfId], references: [id])
+  mergedReports     HazardReport[]  @relation("Merges")
+
+  @@index([status])
+  @@index([hazardClass])
+  @@index([lat, lng])
+  @@index([userId])
+  @@index([createdAt])
+  @@index([duplicateOfId])
+}
+
+model Detection {
+  id               String  @id @default(cuid())
+  reportId         String?
+  report           HazardReport? @relation(fields: [reportId], references: [id])
+  inferenceJobId   String?
+  modelVersion     String
+  engine           String  @default("demo-engine-v2") // yolo-service | glm-vision | demo-engine-v2
+  hazardClass      String
+  confidence       Float
+  bboxX            Float // normalized 0..1
+  bboxY            Float
+  bboxW            Float
+  bboxH            Float
+  areaRatio        Float
+  severity         Int
+  annotatedMediaId String?
+  inferenceMs      Int?
+  createdAt        DateTime @default(now())
+
+  @@index([reportId])
+}
+
+model HazardCluster {
+  id            String   @id @default(cuid())
+  label         String
+  centerLat     Float
+  centerLng     Float
+  radiusM       Float    @default(0)
+  hazardCount   Int      @default(0)
+  dominantClass String?
+  avgSeverity   Float    @default(0)
+  maxSeverity   Int      @default(0)
+  paramsJson    String? // { epsM, minPts, sinceDays }
+  computedAt    DateTime @default(now())
+
+  reports    HazardReport[]
+  members    ClusterMembership[]
+  workOrders WorkOrder[]
+}
+
+model ClusterMembership {
+  id        String        @id @default(cuid())
+  clusterId String
+  cluster   HazardCluster @relation(fields: [clusterId], references: [id], onDelete: Cascade)
+  reportId  String        @unique
+  report    HazardReport  @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  distanceM Float
+  createdAt DateTime      @default(now())
+
+  @@index([clusterId])
+}
+
+model PriorityScore {
+  id              String   @id @default(cuid())
+  reportId        String   @unique
+  report          HazardReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  score           Float
+  band            String // CRITICAL | HIGH | MODERATE | LOW
+  severityNorm    Float
+  densityNorm     Float
+  criticalityNorm Float
+  recurrenceNorm  Float
+  ageNorm         Float
+  weightsJson     String
+  explanationJson String
+  riskFlagsJson   String? // explainable boolean risk signals (traffic exposure, size, repeats…)
+  recommendedAction String? // severity-driven next step, admin-configurable (system_settings.risk.actions)
+  overridden      Boolean  @default(false)
+  overriddenBy    String?
+  manualScore     Float?
+  computedAt      DateTime @default(now())
+
+  @@index([score])
+}
+
+model WorkOrder {
+  id             String    @id @default(cuid())
+  code           String    @unique
+  title          String
+  description    String?
+  status         String    @default("OPEN")
+  // OPEN → ASSIGNED → IN_PROGRESS → COMPLETED → VERIFICATION_PENDING → VERIFIED → CLOSED
+  // (COMPLETED may also be set directly by evidence submission which auto-advances to
+  //  VERIFICATION_PENDING; VERIFICATION_PENDING can be rejected back to IN_PROGRESS.)
+  priority       Float     @default(0)
+  band           String    @default("MODERATE")
+  hazardReportId String?   @unique
+  hazardReport   HazardReport? @relation(fields: [hazardReportId], references: [id])
+  clusterId      String?
+  cluster        HazardCluster? @relation(fields: [clusterId], references: [id])
+  department     String?   // e.g. Road Maintenance (system_settings.org.departments)
+  assignedTeam   String?   // e.g. Ward 7 crew (system_settings.org.teams)
+  assignedTo     String?   // crew/contractor free text (legacy-friendly)
+  assignedUserId String?
+  assignedUser   User?     @relation("AssignedFieldWorker", fields: [assignedUserId], references: [id])
+  assignedAt     DateTime?
+  scheduledFor   DateTime?
+  dueDate        DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  resolutionNotes String?
+  beforeMediaId  String?
+  afterMediaId   String?
+  verifiedBy     String?
+  verifiedAt     DateTime?
+  rejectReason   String?
+  createdBy      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  updates WorkOrderUpdate[]
+
+  @@index([status])
+  @@index([assignedUserId])
+}
+
+model WorkOrderUpdate {
+  id          String   @id @default(cuid())
+  workOrderId String
+  workOrder   WorkOrder @relation(fields: [workOrderId], references: [id], onDelete: Cascade)
+  authorId    String?
+  author      User?    @relation(fields: [authorId], references: [id])
+  fromStatus  String?
+  toStatus    String?
+  note        String?
+  createdAt   DateTime @default(now())
+
+  @@index([workOrderId])
+}
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorId      String?
+  actorEmail   String?
+  actorRole    String?
+  action       String
+  entityType   String
+  entityId     String?
+  metadataJson String?
+  ip           String?
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String // REPORT_SUBMITTED | REPORT_REVIEWED | WORK_ORDER | SYSTEM
+  title     String
+  body      String
+  read      Boolean  @default(false)
+  link      String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, read])
+}
+
+model ModelVersion {
+  id          String  @id @default(cuid())
+  version     String  @unique
+  framework   String  @default("pytorch-ultralytics")
+  weightsRef  String?
+  mAP50       Float?
+  mAP5095     Float?
+  precision   Float?
+  recall      Float?
+  latencyMs   Int?
+  datasetRef  String?
+  notes       String?
+  mlflowRunId String?
+  registeredAt DateTime @default(now())
+}
+
+model InferenceJob {
+  id          String    @id @default(cuid())
+  mediaId     String
+  media       MediaAsset @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  status      String    @default("QUEUED") // QUEUED | RUNNING | SUCCEEDED | FAILED
+  engine      String    @default("demo-engine-v2")
+  modelVersion String?
+  progress    Int       @default(0)
+  framesTotal Int?
+  framesDone  Int?
+  resultJson  String?
+  error       String?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([status])
+}
+
+model SystemSetting {
+  key       String   @id
+  valueJson String
+  updatedAt DateTime @updatedAt
+}

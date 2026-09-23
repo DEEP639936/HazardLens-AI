@@ -1,0 +1,328 @@
+# =============================================================================
+# HazardLensAI — Full Production Stack (Docker Compose)
+#
+#   `docker compose up --build` brings up the FULL production stack:
+#     frontend (Next.js) · api (FastAPI + PostGIS) · worker (Celery)
+#     db (PostgreSQL 16 + PostGIS) · redis · ml-inference (YOLO/ONNX)
+#     mlflow · minio (+ one-shot bucket init) · optional pgadmin (tools profile)
+#
+#   NOTE: the interactive sandbox demo runs the Next.js app ONLY (bun run dev,
+#   port 3000, Prisma/SQLite). The services below are the deployable
+#   production topology referenced by infrastructure/README.md and CI.
+#
+#   Prereqs: copy .env.example → .env and fill secrets. Copy `backend/` and
+#   `ml/` must exist (they ship their own Dockerfiles, built in place).
+#
+#   Env interpolation: ${VAR:-default} is resolved from the repo-root `.env`
+#   file; every default below is a local-only value — never rely on them in
+#   a shared/production environment.
+# =============================================================================
+
+name: roadguard-atlas
+
+# ---- Shared API/worker environment (kept identical on purpose) --------------
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-production}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DATABASE_URL: postgresql+psycopg://roadguard:${POSTGRES_PASSWORD:-roadguard}@db:5432/roadguard
+  REDIS_URL: redis://redis:6379/0
+  JWT_SECRET: ${JWT_SECRET:-change-me-min-32-chars-local-only}
+  JWT_ACCESS_TTL_MINUTES: ${JWT_ACCESS_TTL_MINUTES:-15}
+  JWT_REFRESH_TTL_DAYS: ${JWT_REFRESH_TTL_DAYS:-30}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+  STORAGE_BACKEND: ${STORAGE_BACKEND:-local}          # local | s3 | cloudinary
+  UPLOAD_DIR: /app/uploads
+  S3_ENDPOINT: http://minio:9000                      # MinIO object storage
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_BUCKET: ${S3_BUCKET:-roadguard-media}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-roadguard}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-roadguard-minio-secret}
+  S3_FORCE_PATH_STYLE: "true"                         # required for MinIO
+  CLOUDINARY_URL: ${CLOUDINARY_URL:-}
+  INFERENCE_SERVICE_URL: http://ml-inference:8100
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  MLFLOW_S3_ENDPOINT_URL: http://minio:9000           # MLflow artifacts → MinIO
+  AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-roadguard}
+  AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-roadguard-minio-secret}
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  CELERY_APP: ${CELERY_APP:-backend.app.celery_app.celery_app}
+  CELERY_LOG_LEVEL: ${CELERY_LOG_LEVEL:-INFO}
+
+services:
+  # --------------------------------------------------------------------------
+  # Frontend — Next.js standalone build (repo-root context)
+  # --------------------------------------------------------------------------
+  frontend:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/frontend.Dockerfile
+    image: roadguard-atlas/frontend:local
+    container_name: roadguard-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Browser-facing config (baked into the client bundle)
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+      NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-HazardLensAI}
+      NEXT_PUBLIC_MAP_TILES_URL: ${NEXT_PUBLIC_MAP_TILES_URL:-https://tile.openstreetmap.org/{z}/{x}/{y}.png}
+      NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+      # Live-demo fallback only: lets the standalone server answer its own
+      # /api routes (Prisma/SQLite) when it is NOT pointed at the FastAPI api.
+      DATABASE_URL: ${FRONTEND_DATABASE_URL:-file:/app/db/custom.db}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:3000/ >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - rg-net
+
+  # --------------------------------------------------------------------------
+  # API — FastAPI (built from ./backend, which owns its own Dockerfile)
+  # --------------------------------------------------------------------------
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: roadguard-atlas/api:local
+    container_name: roadguard-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+      ml-inference:
+        condition: service_started
+    volumes:
+      - uploads:/app/uploads        # local storage backend (STORAGE_BACKEND=local)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - rg-net
+
+  # --------------------------------------------------------------------------
+  # Worker — Celery (same backend image, celery entrypoint override)
+  # --------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: roadguard-atlas/worker:local
+    container_name: roadguard-worker
+    restart: unless-stopped
+    # $${...} is expanded inside the container (not by compose) so the celery
+    # app path stays overridable via `docker compose exec` / .env without a
+    # rebuild. Adjust CELERY_APP in .env if backend/ names the app differently.
+    command: ["sh", "-c", "exec celery -A \"$${CELERY_APP:-backend.app.celery_app.celery_app}\" worker --loglevel=\"$${CELERY_LOG_LEVEL:-INFO}\" --concurrency=2"]
+    environment:
+      <<: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/uploads        # shared media volume with the api
+    stop_grace_period: 30s          # allow celery warm shutdown
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A \"$${CELERY_APP:-backend.app.celery_app.celery_app}\" inspect ping -d \"celery@$${HOSTNAME}\" | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - rg-net
+
+  # --------------------------------------------------------------------------
+  # Database — PostgreSQL 16 + PostGIS 3.4
+  # --------------------------------------------------------------------------
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: roadguard-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: roadguard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-roadguard}
+      POSTGRES_DB: roadguard
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"       # host access for psql/alembic only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U roadguard -d roadguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - rg-net
+
+  # --------------------------------------------------------------------------
+  # Redis — cache, rate limiting, celery broker
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: roadguard-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - rg-net
+
+  # --------------------------------------------------------------------------
+  # ML inference — YOLO/ONNX service (built from ./ml, owns its Dockerfile)
+  # --------------------------------------------------------------------------
+  ml-inference:
+    build:
+      context: ./ml
+      dockerfile: Dockerfile
+    image: roadguard-atlas/ml-inference:local
+    container_name: roadguard-ml-inference
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    environment:
+      MODEL_PATH: ${MODEL_PATH:-/models/best.onnx}   # exported ONNX weights
+      INFERENCE_DEVICE: ${INFERENCE_DEVICE:-cpu}
+    volumes:
+      - ./ml/models:/models:ro                       # exported weights live here
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - rg-net
+
+  # --------------------------------------------------------------------------
+  # MLflow — experiment tracking + model registry
+  # (absolute sqlite URI: 4 slashes; artifacts served from /mlflow/artifacts)
+  # --------------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: roadguard-mlflow
+    restart: unless-stopped
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+    environment:
+      MLFLOW_FLASK_SERVER_SECRET_KEY: ${MLFLOW_SECRET_KEY:-local-only-mlflow-secret}
+    volumes:
+      - mlflow_data:/mlflow
+    ports:
+      - "127.0.0.1:5000:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - rg-net
+
+  # --------------------------------------------------------------------------
+  # MinIO — S3-compatible object storage (media assets, MLflow artifacts)
+  # --------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: roadguard-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-roadguard}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-roadguard-minio-secret}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"                 # S3 API
+      - "9001:9001"                 # web console
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - rg-net
+
+  # One-shot bucket provisioning (roadguard-media) — exits 0 when done
+  minio-init:
+    image: minio/mc:latest
+    container_name: roadguard-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-roadguard}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-roadguard-minio-secret}
+    entrypoint: >
+      sh -c "
+        mc alias set rg http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\" &&
+        mc mb -p rg/roadguard-media &&
+        echo 'MinIO ready: bucket roadguard-media created (private by default)'
+      "
+    restart: "no"
+    networks:
+      - rg-net
+
+  # --------------------------------------------------------------------------
+  # OPTIONAL — pgAdmin (docker compose --profile tools up pgadmin)
+  # --------------------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: roadguard-pgadmin
+    profiles: ["tools"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@roadguardatlas.dev}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-roadguard-pgadmin}
+      PGADMIN_CONFIG_SERVER_MODE: "True"
+    ports:
+      - "127.0.0.1:5050:80"
+    depends_on:
+      - db
+    networks:
+      - rg-net
+
+networks:
+  rg-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  mlflow_data:
+  minio_data:
+  uploads:

@@ -1,0 +1,14 @@
+# Generated artifacts — never commit
+datasets/
+!datasets/.gitkeep
+runs/
+mlruns/
+reports/
+models/
+mlartifacts/
+*.pt
+*.onnx
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
